@@ -28,7 +28,7 @@ jobs:
 
   e2e:
     name: Run the action on the fixture
-    # The fixture rule reports a finding only on changed lines, and only a pull request has changed lines.
+    # The summary comment needs a pull request.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -43,5 +43,26 @@ jobs:
           version: 0.7.3
           working-directory: test/fixture
           check-name: alint (fixture)
-      - name: Report the outputs
-        run: echo "errors=${{ steps.alint.outputs.errors }} warnings=${{ steps.alint.outputs.warnings }}"
+          # Most pull requests do not change the fixture, so the changed-line scope finds nothing there.
+          files: src
+          # The fixture rule does not call this provider. The configuration proves that alint accepts the file.
+          provider-config: |
+            version = 1
+
+            [[providers]]
+            id = "fixture"
+            type = "openai-compatible"
+            endpoint = "https://provider.invalid/v1"
+
+            [[providers.models]]
+            id = "fixture-model"
+            size = "small"
+            aliases = [ "default" ]
+            capabilities = [ "tool-call" ]
+
+            [providers.models.default_params]
+            thinking = { type = "disabled" }
+      - name: Check that alint reads the provider configuration
+        run: alint config models show fixture/fixture-model
+      - name: Check the outputs
+        run: test "${{ steps.alint.outputs.errors }}/${{ steps.alint.outputs.warnings }}" = "0/1"

@@ -1,6 +1,6 @@
 import type { AddressInfo } from 'node:net'
 
-import type { PullRequestFile } from './changes'
+import type { ChangedFile } from './changes'
 import type { Diagnostic } from './output'
 
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
@@ -15,7 +15,7 @@ import { run } from './main'
 
 interface FakeApi {
   comments?: Array<{ body: string, id: number }>
-  files?: PullRequestFile[]
+  files?: ChangedFile[]
   status?: number
 }
 
@@ -112,15 +112,38 @@ describe('action', () => {
     expect(api.requests[0]?.body?.output.annotations).toHaveLength(1)
   })
 
-  it('lints the working directory and writes no comment outside a pull request', async () => {
-    const api = await startGitHubApi({})
-    const workspace = await createWorkspace({ diagnostics: [warning('src/a.ts', 40)] })
+  it('lints the changes of a push and writes no comment', async () => {
+    const api = await startGitHubApi({ files: [{ filename: 'src/a.ts', patch: '@@ -1,0 +2 @@', status: 'modified' }] })
+    const workspace = await createWorkspace({ diagnostics: [warning('src/a.ts', 2), warning('src/a.ts', 40)] })
 
     await run({ ...environment(workspace, api.url), GITHUB_EVENT_PATH: join(workspace, 'push.json') }, workspace)
 
+    expect(await readArguments(workspace)).toEqual(['--format', 'json', 'src/a.ts'])
+    expect(api.requests.map(request => `${request.method} ${request.url}`)).toEqual([
+      'GET /repos/acme/app/compare/1111111...2222222',
+      'POST /repos/acme/app/check-runs',
+    ])
+    expect(api.requests[1]?.body?.head_sha).toBe('push-commit')
+    expect(api.requests[1]?.body?.output.annotations).toHaveLength(1)
+  })
+
+  it('compares a new branch with the default branch', async () => {
+    const api = await startGitHubApi({ files: [] })
+    const workspace = await createWorkspace({ diagnostics: [] })
+
+    await run({ ...environment(workspace, api.url), GITHUB_EVENT_PATH: join(workspace, 'new-branch.json') }, workspace)
+
+    expect(api.requests[0]?.url).toBe('/repos/acme/app/compare/main...2222222')
+  })
+
+  it('lints the working directory for an event without changes', async () => {
+    const api = await startGitHubApi({})
+    const workspace = await createWorkspace({ diagnostics: [warning('src/a.ts', 40)] })
+
+    await run({ ...environment(workspace, api.url), GITHUB_EVENT_PATH: join(workspace, 'manual.json') }, workspace)
+
     expect(await readArguments(workspace)).toEqual(['--format', 'json', '.'])
     expect(api.requests.map(request => `${request.method} ${request.url}`)).toEqual(['POST /repos/acme/app/check-runs'])
-    expect(api.requests[0]?.body?.head_sha).toBe('push-commit')
   })
 
   it('sends annotations above the request limit in update requests', async () => {
@@ -173,7 +196,9 @@ async function createWorkspace(result: { diagnostics: Diagnostic[], exitCode?: n
   await writeFile(join(workspace, 'src/a.ts'), '')
   await writeFile(join(workspace, 'packages/app/src/a.ts'), '')
   await writeFile(join(workspace, 'event.json'), JSON.stringify({ pull_request: { head: { sha: 'abcdef0123' }, number: 12 } }))
-  await writeFile(join(workspace, 'push.json'), JSON.stringify({ ref: 'refs/heads/main' }))
+  await writeFile(join(workspace, 'push.json'), JSON.stringify({ after: '2222222', before: '1111111', repository: { default_branch: 'main' } }))
+  await writeFile(join(workspace, 'new-branch.json'), JSON.stringify({ after: '2222222', before: '0000000', repository: { default_branch: 'main' } }))
+  await writeFile(join(workspace, 'manual.json'), JSON.stringify({ inputs: {} }))
   await writeFile(join(workspace, 'result.json'), JSON.stringify({
     exitCode: result.exitCode ?? 0,
     stderr: result.stderr ?? '',
@@ -229,6 +254,11 @@ async function startGitHubApi(options: FakeApi) {
 
       if (request.method !== 'GET') {
         response.end(JSON.stringify({ id: 77 }))
+        return
+      }
+
+      if (url.includes('/compare/')) {
+        response.end(JSON.stringify({ files: options.files ?? [] }))
         return
       }
 

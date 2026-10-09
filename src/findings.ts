@@ -1,4 +1,4 @@
-import type { Diagnostic } from './output'
+import type { Diagnostic, RunResult } from './output'
 
 export interface Annotation {
   annotation_level: 'failure' | 'warning'
@@ -25,11 +25,14 @@ export interface SummaryContext {
   runUrl?: string
   serverUrl: string
   sha: string
-  totalTokens: number
+  /** The cost of the run, from `formatUsage`. */
+  usage: string
 }
 
 /** Identifies the summary comment so that later runs rewrite it instead of adding another one. */
 export const summaryMarker = '<!-- alint-summary -->'
+
+const suggestionParagraph = /\n\s*Suggestion:/u
 
 // GitHub rejects a comment or a check summary above 65536 characters.
 // One row is a few hundred characters, so this cap keeps the table far below the limit.
@@ -63,7 +66,7 @@ export function formatSummary(findings: readonly Finding[], context: SummaryCont
   const footer = [
     `Commit \`${shortSha}\``,
     context.runUrl === undefined ? undefined : `[run](${context.runUrl})`,
-    `${context.totalTokens.toLocaleString('en-US')} tokens`,
+    context.usage,
   ].filter(part => part !== undefined)
 
   lines.push('', `<sub>${footer.join(' · ')}</sub>`)
@@ -83,6 +86,15 @@ export function formatTitle(findings: readonly Finding[]): string {
     errors > 0 ? pluralize(errors, 'error') : undefined,
     warnings > 0 ? pluralize(warnings, 'warning') : undefined,
   ].filter(part => part !== undefined).join(', ')
+}
+
+/** States the cost of a run, so that a reader can see from the check run whether the cache works. */
+export function formatUsage(result: Pick<RunResult, 'execution' | 'usage'>): string {
+  const tokens = `${result.usage.inputTokens.toLocaleString('en-US')} input / ${result.usage.outputTokens.toLocaleString('en-US')} output tokens`
+
+  return result.execution === undefined
+    ? tokens
+    : `${pluralize(result.execution.completed, 'rule run')}, ${result.execution.cached} cached · ${tokens}`
 }
 
 export function toAnnotations(findings: readonly Finding[]): Annotation[] {
@@ -110,15 +122,21 @@ export function toFindings(
   toRepositoryPath: (filePath: string) => string,
 ): Finding[] {
   return diagnostics
-    .map((diagnostic): Finding => ({
-      // A diagnostic without a location is about the whole file. An annotation needs a line.
-      line: diagnostic.loc?.start.line ?? 1,
-      message: diagnostic.message.trim(),
-      path: toRepositoryPath(diagnostic.filePath),
-      ruleId: diagnostic.ruleId,
-      severity: diagnostic.severity,
-      suggestion: suggestionFrom(diagnostic.evidence),
-    }))
+    .map((diagnostic): Finding => {
+      // Some rules append the remediation to the message as a `Suggestion:` paragraph.
+      // https://github.com/alint-dev/alint/blob/ab0be9a/packages/plugin-js/src/rules/no-mixed-layers-without-abstraction/rule.ts#L391-L396
+      const [message = '', ...paragraphs] = diagnostic.message.split(suggestionParagraph)
+
+      return {
+        // A diagnostic without a location is about the whole file. An annotation needs a line.
+        line: diagnostic.loc?.start.line ?? 1,
+        message: message.trim(),
+        path: toRepositoryPath(diagnostic.filePath),
+        ruleId: diagnostic.ruleId,
+        severity: diagnostic.severity,
+        suggestion: suggestionFrom(diagnostic.evidence) ?? (paragraphs.join('\n').trim() || undefined),
+      }
+    })
     .sort((a, b) =>
       Number(b.severity === 'error') - Number(a.severity === 'error')
       || a.path.localeCompare(b.path)
