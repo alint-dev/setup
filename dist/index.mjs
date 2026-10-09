@@ -513,6 +513,7 @@ function toChangedLines(files) {
 //#region src/findings.ts
 /** Identifies the summary comment so that later runs rewrite it instead of adding another one. */
 const summaryMarker = "<!-- alint-summary -->";
+const suggestionParagraph = /\n\s*Suggestion:/u;
 const maxSummaryRows = 100;
 function formatSummary(findings, context) {
 	const icon = toConclusion(findings) === "failure" ? "❌" : findings.length > 0 ? "⚠️" : "✅";
@@ -535,7 +536,7 @@ function formatSummary(findings, context) {
 	const footer = [
 		`Commit \`${shortSha}\``,
 		context.runUrl === void 0 ? void 0 : `[run](${context.runUrl})`,
-		`${context.totalTokens.toLocaleString("en-US")} tokens`
+		context.usage
 	].filter((part) => part !== void 0);
 	lines.push("", `<sub>${footer.join(" · ")}</sub>`);
 	return lines.join("\n");
@@ -545,6 +546,11 @@ function formatTitle(findings) {
 	const errors = findings.filter((finding) => finding.severity === "error").length;
 	const warnings = findings.length - errors;
 	return [errors > 0 ? pluralize(errors, "error") : void 0, warnings > 0 ? pluralize(warnings, "warning") : void 0].filter((part) => part !== void 0).join(", ");
+}
+/** States the cost of a run, so that a reader can see from the check run whether the cache works. */
+function formatUsage(result) {
+	const tokens = `${result.usage.inputTokens.toLocaleString("en-US")} input / ${result.usage.outputTokens.toLocaleString("en-US")} output tokens`;
+	return result.execution === void 0 ? tokens : `${pluralize(result.execution.completed, "rule run")}, ${result.execution.cached} cached · ${tokens}`;
 }
 function toAnnotations(findings) {
 	return findings.map((finding) => ({
@@ -562,14 +568,17 @@ function toConclusion(findings) {
 }
 /** Converts diagnostics to findings with repository-relative paths. Errors come first. */
 function toFindings(diagnostics, toRepositoryPath) {
-	return diagnostics.map((diagnostic) => ({
-		line: diagnostic.loc?.start.line ?? 1,
-		message: diagnostic.message.trim(),
-		path: toRepositoryPath(diagnostic.filePath),
-		ruleId: diagnostic.ruleId,
-		severity: diagnostic.severity,
-		suggestion: suggestionFrom(diagnostic.evidence)
-	})).sort((a, b) => Number(b.severity === "error") - Number(a.severity === "error") || a.path.localeCompare(b.path) || a.line - b.line);
+	return diagnostics.map((diagnostic) => {
+		const [message = "", ...paragraphs] = diagnostic.message.split(suggestionParagraph);
+		return {
+			line: diagnostic.loc?.start.line ?? 1,
+			message: message.trim(),
+			path: toRepositoryPath(diagnostic.filePath),
+			ruleId: diagnostic.ruleId,
+			severity: diagnostic.severity,
+			suggestion: suggestionFrom(diagnostic.evidence) ?? (paragraphs.join("\n").trim() || void 0)
+		};
+	}).sort((a, b) => Number(b.severity === "error") - Number(a.severity === "error") || a.path.localeCompare(b.path) || a.line - b.line);
 }
 function escapeCell(value) {
 	return value.replaceAll("|", "\\|").replaceAll(/\s*\n\s*/gu, " ");
@@ -595,6 +604,11 @@ const filesSchema = /* @__PURE__ */ array(/* @__PURE__ */ object({
 	patch: /* @__PURE__ */ optional(/* @__PURE__ */ string()),
 	status: /* @__PURE__ */ string()
 }));
+const comparisonSchema = /* @__PURE__ */ object({ files: filesSchema });
+/** Lists the files that differ between two commits. GitHub returns at most 300 files here. */
+async function listComparedFiles(repository, base, head) {
+	return parse(comparisonSchema, await request(repository, "GET", `/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`)).files;
+}
 async function listPullRequestFiles(repository, pullRequest) {
 	const files = [];
 	for (let page = 1;; page += 1) {
@@ -1018,7 +1032,14 @@ const runResultSchema = /* @__PURE__ */ object({
 		ruleId: /* @__PURE__ */ string(),
 		severity: /* @__PURE__ */ picklist(["error", "warn"])
 	})),
-	usage: /* @__PURE__ */ object({ totalTokens: /* @__PURE__ */ number() })
+	execution: /* @__PURE__ */ optional(/* @__PURE__ */ object({
+		cached: /* @__PURE__ */ number(),
+		completed: /* @__PURE__ */ number()
+	})),
+	usage: /* @__PURE__ */ object({
+		inputTokens: /* @__PURE__ */ number(),
+		outputTokens: /* @__PURE__ */ number()
+	})
 });
 function parseRunResult(json) {
 	return parse(runResultSchema, JSON.parse(json));
@@ -1037,10 +1058,16 @@ async function runAlint(command, targets, cwd) {
 }
 //#endregion
 //#region src/main.ts
-const eventSchema = /* @__PURE__ */ object({ pull_request: /* @__PURE__ */ optional(/* @__PURE__ */ object({
-	head: /* @__PURE__ */ object({ sha: /* @__PURE__ */ string() }),
-	number: /* @__PURE__ */ number()
-})) });
+const eventSchema = /* @__PURE__ */ object({
+	after: /* @__PURE__ */ optional(/* @__PURE__ */ string()),
+	before: /* @__PURE__ */ optional(/* @__PURE__ */ string()),
+	pull_request: /* @__PURE__ */ optional(/* @__PURE__ */ object({
+		head: /* @__PURE__ */ object({ sha: /* @__PURE__ */ string() }),
+		number: /* @__PURE__ */ number()
+	})),
+	repository: /* @__PURE__ */ optional(/* @__PURE__ */ object({ default_branch: /* @__PURE__ */ string() }))
+});
+const zeroCommit = /^0+$/u;
 async function run(env, cwd) {
 	const repository = {
 		apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
@@ -1049,13 +1076,17 @@ async function run(env, cwd) {
 	};
 	const workspace = env.GITHUB_WORKSPACE ?? cwd;
 	const serverUrl = env.GITHUB_SERVER_URL ?? "https://github.com";
-	const pullRequest = await readPullRequest(env.GITHUB_EVENT_PATH);
-	const sha = pullRequest?.sha ?? required(env, "GITHUB_SHA");
+	const event = await readEvent(env.GITHUB_EVENT_PATH);
+	const pullRequest = event.pull_request;
+	const sha = pullRequest?.head.sha ?? required(env, "GITHUB_SHA");
 	const toRepositoryPath = (filePath) => relative(workspace, resolve$1(cwd, filePath));
-	const scope = await resolveScope(repository, pullRequest, env.INPUT_FILES ?? "", cwd, workspace);
+	const scope = await resolveScope(repository, event, env.INPUT_FILES ?? "", cwd, workspace);
 	const result = scope.targets.length === 0 ? {
 		diagnostics: [],
-		usage: { totalTokens: 0 }
+		usage: {
+			inputTokens: 0,
+			outputTokens: 0
+		}
 	} : await runAlint(required(env, "ALINT_COMMAND"), scope.targets, cwd);
 	const findings = toFindings(scope.changedLines === void 0 ? result.diagnostics : filterToChangedLines(result.diagnostics, scope.changedLines, toRepositoryPath), toRepositoryPath);
 	const title = formatTitle(findings);
@@ -1064,7 +1095,7 @@ async function run(env, cwd) {
 		runUrl: env.GITHUB_RUN_ID === void 0 ? void 0 : `${serverUrl}/${repository.repository}/actions/runs/${env.GITHUB_RUN_ID}`,
 		serverUrl,
 		sha,
-		totalTokens: result.usage.totalTokens
+		usage: formatUsage(result)
 	});
 	if (env.GITHUB_STEP_SUMMARY !== void 0) await appendFile(env.GITHUB_STEP_SUMMARY, `${summary}\n`);
 	if (env.GITHUB_OUTPUT !== void 0) {
@@ -1082,13 +1113,16 @@ async function run(env, cwd) {
 	if (pullRequest !== void 0) await publishSummaryComment(repository, pullRequest.number, summary, findings.length > 0);
 	console.info(`Published ${title.toLowerCase()} to ${repository.repository}@${sha.slice(0, 7)}.`);
 }
-async function readPullRequest(eventPath) {
-	if (eventPath === void 0) return;
-	const event = parse(eventSchema, JSON.parse(await readFile(eventPath, "utf8")));
-	return event.pull_request === void 0 ? void 0 : {
-		number: event.pull_request.number,
-		sha: event.pull_request.head.sha
-	};
+/** Lists the files that the event changed. `undefined` means that the event has no changes, for example a manual run. */
+async function listChangedFiles(repository, event) {
+	if (event.pull_request !== void 0) return listPullRequestFiles(repository, event.pull_request.number);
+	if (event.before === void 0 || event.after === void 0) return;
+	if (zeroCommit.test(event.after)) return [];
+	const base = zeroCommit.test(event.before) ? event.repository?.default_branch : event.before;
+	return base === void 0 ? void 0 : listComparedFiles(repository, base, event.after);
+}
+async function readEvent(eventPath) {
+	return eventPath === void 0 ? {} : parse(eventSchema, JSON.parse(await readFile(eventPath, "utf8")));
 }
 function required(env, name) {
 	const value = env[name];
@@ -1098,14 +1132,15 @@ function required(env, name) {
 /**
 * Selects what alint reads.
 *
-* Explicit files win. A pull request without explicit files gets its changed files,
+* Explicit files win. A pull request or a push without explicit files gets its changed files,
 * and the result keeps only the changed lines. Other events get the whole working directory.
 */
-async function resolveScope(repository, pullRequest, files, cwd, workspace) {
+async function resolveScope(repository, event, files, cwd, workspace) {
 	const explicit = files.split(/\s+/u).filter(Boolean);
 	if (explicit.length > 0) return { targets: explicit };
-	if (pullRequest === void 0) return { targets: ["."] };
-	const changedLines = toChangedLines(await listPullRequestFiles(repository, pullRequest.number));
+	const changedFiles = await listChangedFiles(repository, event);
+	if (changedFiles === void 0) return { targets: ["."] };
+	const changedLines = toChangedLines(changedFiles);
 	return {
 		changedLines,
 		targets: [...changedLines.keys()].map((path) => relative(cwd, resolve$1(workspace, path))).filter((path) => !path.startsWith("..") && existsSync(resolve$1(cwd, path)))
