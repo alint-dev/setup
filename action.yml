@@ -1,0 +1,116 @@
+name: alint
+description: Run alint on a pull request and publish the result as a check run and a summary comment
+author: alint-dev
+branding:
+  icon: check-circle
+  color: purple
+
+inputs:
+  version:
+    description: >-
+      Version of @alint-js/cli to install. When empty, the action uses the alint that the project
+      installed in node_modules, or installs the latest version.
+    default: ''
+  provider-endpoint:
+    description: >-
+      Endpoint of an OpenAI-compatible model provider. When empty, the action does not write
+      provider configuration.
+    default: ''
+  provider-model:
+    description: Model id for the provider. Required with provider-endpoint.
+    default: ''
+  api-key:
+    description: API key for the provider. The action sends it as a Bearer token.
+    default: ''
+  files:
+    description: >-
+      Files or directories to lint, separated by spaces or lines. When empty, a pull request gets
+      its changed lines and other events get the working directory.
+    default: ''
+  working-directory:
+    description: Directory that contains the alint configuration.
+    default: .
+  check-name:
+    description: Name of the check run.
+    default: alint
+  github-token:
+    description: Token that creates the check run and the summary comment.
+    default: ${{ github.token }}
+
+outputs:
+  errors:
+    description: Number of error findings.
+    value: ${{ steps.run.outputs.errors }}
+  warnings:
+    description: Number of warning findings.
+    value: ${{ steps.run.outputs.warnings }}
+
+runs:
+  using: composite
+  steps:
+    # A pull request from a fork gets no secrets and a read-only token, so the action cannot publish there.
+    - id: guard
+      shell: bash
+      run: |
+        if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ "$(jq -r '.pull_request.head.repo.full_name' "$GITHUB_EVENT_PATH")" != "$GITHUB_REPOSITORY" ]; then
+          echo "::notice title=alint::Skipped. A pull request from a fork cannot publish the result."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - id: install
+      if: steps.guard.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ALINT_VERSION: ${{ inputs.version }}
+      run: |
+        if [ -z "$ALINT_VERSION" ] && [ -x node_modules/.bin/alint ]; then
+          echo "command=$PWD/node_modules/.bin/alint" >> "$GITHUB_OUTPUT"
+        else
+          npm install --global "@alint-js/cli@${ALINT_VERSION:-latest}"
+          echo "command=alint" >> "$GITHUB_OUTPUT"
+        fi
+
+    - if: steps.guard.outputs.skip != 'true' && inputs.provider-endpoint != ''
+      shell: bash
+      env:
+        ALINT: ${{ steps.install.outputs.command }}
+        ALINT_API_KEY: ${{ inputs.api-key }}
+        ALINT_ENDPOINT: ${{ inputs.provider-endpoint }}
+        ALINT_MODEL: ${{ inputs.provider-model }}
+      run: |
+        "$ALINT" setup --no-interactive \
+          --provider-id ci \
+          --provider-endpoint "$ALINT_ENDPOINT" \
+          --provider-model "$ALINT_MODEL" \
+          ${ALINT_API_KEY:+--provider-header "Authorization=Bearer $ALINT_API_KEY"}
+
+    - if: steps.guard.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ALINT: ${{ steps.install.outputs.command }}
+      run: |
+        "$ALINT" plugin install
+
+    - if: steps.guard.outputs.skip != 'true'
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.working-directory }}/.alintcache
+        # alint keys each cached result by the file content and the rule text.
+        # A new key for each commit saves the latest cache, and the prefix restores the most recent one.
+        key: alint-${{ runner.os }}-${{ github.sha }}
+        restore-keys: |
+          alint-${{ runner.os }}-
+
+    - id: run
+      if: steps.guard.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ALINT_COMMAND: ${{ steps.install.outputs.command }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_CHECK_NAME: ${{ inputs.check-name }}
+        INPUT_FILES: ${{ inputs.files }}
+      run: |
+        node "$GITHUB_ACTION_PATH/dist/index.mjs"
