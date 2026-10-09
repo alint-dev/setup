@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  check:
+    name: Lint, typecheck, test, and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test:run
+      - run: pnpm build
+      # The action runs the committed bundle, so it must match the source.
+      - name: Check that dist is current
+        run: git diff --exit-code -- dist
+
+  e2e:
+    name: Run the action on the fixture
+    # The fixture rule reports a finding only on changed lines, and only a pull request has changed lines.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - id: alint
+        uses: ./
+        with:
+          version: 0.7.3
+          working-directory: test/fixture
+          check-name: alint (fixture)
+      - name: Report the outputs
+        run: echo "errors=${{ steps.alint.outputs.errors }} warnings=${{ steps.alint.outputs.warnings }}"
