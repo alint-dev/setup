@@ -14,7 +14,9 @@ const runResultSchema = object({
     ruleId: string(),
     severity: picklist(['error', 'warn']),
   })),
-  usage: object({ totalTokens: number() }),
+  // Counts of rule executions. Output from an old alint version does not have them.
+  execution: optional(object({ cached: number(), completed: number() })),
+  usage: object({ inputTokens: number(), outputTokens: number() }),
 })
 
 export type Diagnostic = RunResult['diagnostics'][number]

@@ -1,4 +1,4 @@
-import type { PullRequestFile } from './changes'
+import type { ChangedFile } from './changes'
 import type { Annotation, Conclusion } from './findings'
 
 import { array, number, object, optional, parse, string } from 'valibot'
@@ -28,9 +28,17 @@ const itemsPerPage = 100
 const checkRunSchema = object({ id: number() })
 const commentsSchema = array(object({ body: optional(string()), id: number() }))
 const filesSchema = array(object({ filename: string(), patch: optional(string()), status: string() }))
+const comparisonSchema = object({ files: filesSchema })
 
-export async function listPullRequestFiles(repository: Repository, pullRequest: number): Promise<PullRequestFile[]> {
-  const files: PullRequestFile[] = []
+/** Lists the files that differ between two commits. GitHub returns at most 300 files here. */
+export async function listComparedFiles(repository: Repository, base: string, head: string): Promise<ChangedFile[]> {
+  const comparison = parse(comparisonSchema, await request(repository, 'GET', `/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`))
+
+  return comparison.files
+}
+
+export async function listPullRequestFiles(repository: Repository, pullRequest: number): Promise<ChangedFile[]> {
+  const files: ChangedFile[] = []
 
   for (let page = 1; ; page += 1) {
     const items = parse(filesSchema, await request(repository, 'GET', `/pulls/${pullRequest}/files?per_page=${itemsPerPage}&page=${page}`))

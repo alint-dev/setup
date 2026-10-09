@@ -13,14 +13,21 @@ inputs:
     default: ''
   provider-endpoint:
     description: >-
-      Endpoint of an OpenAI-compatible model provider. When empty, the action does not write
-      provider configuration.
+      Endpoint of an OpenAI-compatible model provider. When this input and provider-config are
+      empty, the action does not write provider configuration.
     default: ''
   provider-model:
     description: Model id for the provider. Required with provider-endpoint.
     default: ''
   api-key:
-    description: API key for the provider. The action sends it as a Bearer token.
+    description: >-
+      API key for the provider. The action sends it as a Bearer token. With provider-endpoint,
+      an empty key skips the action, because the run has no access to secrets.
+    default: ''
+  provider-config:
+    description: >-
+      Complete alint provider configuration in TOML. Use it instead of provider-endpoint when a
+      model needs aliases, capabilities, or default parameters.
     default: ''
   files:
     description: >-
@@ -48,12 +55,25 @@ outputs:
 runs:
   using: composite
   steps:
-    # A pull request from a fork gets no secrets and a read-only token, so the action cannot publish there.
     - id: guard
       shell: bash
+      env:
+        ALINT_API_KEY: ${{ inputs.api-key }}
+        ALINT_CONFIG: ${{ inputs.provider-config }}
+        ALINT_ENDPOINT: ${{ inputs.provider-endpoint }}
       run: |
+        if [ -n "$ALINT_CONFIG" ] && [ -n "$ALINT_ENDPOINT" ]; then
+          echo "::error title=alint::Set provider-config or provider-endpoint, not the two."
+          exit 1
+        fi
+
+        # A pull request from a fork gets no secrets and a read-only token, so the action cannot publish there.
         if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ "$(jq -r '.pull_request.head.repo.full_name' "$GITHUB_EVENT_PATH")" != "$GITHUB_REPOSITORY" ]; then
           echo "::notice title=alint::Skipped. A pull request from a fork cannot publish the result."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        # Other runs without secrets, for example a Dependabot pull request, show as an empty key.
+        elif [ -n "$ALINT_ENDPOINT" ] && [ -z "$ALINT_API_KEY" ]; then
+          echo "::notice title=alint::Skipped. The api-key input is empty."
           echo "skip=true" >> "$GITHUB_OUTPUT"
         fi
 
@@ -84,6 +104,16 @@ runs:
           --provider-endpoint "$ALINT_ENDPOINT" \
           --provider-model "$ALINT_MODEL" \
           ${ALINT_API_KEY:+--provider-header "Authorization=Bearer $ALINT_API_KEY"}
+
+    - if: steps.guard.outputs.skip != 'true' && inputs.provider-config != ''
+      shell: bash
+      env:
+        ALINT_CONFIG: ${{ inputs.provider-config }}
+      run: |
+        # alint reads the global configuration from this path on each platform.
+        directory="${XDG_CONFIG_HOME:-$HOME/.config}/alint"
+        mkdir -p "$directory"
+        (umask 077 && printf '%s\n' "$ALINT_CONFIG" > "$directory/config.toml")
 
     - if: steps.guard.outputs.skip != 'true'
       shell: bash

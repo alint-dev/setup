@@ -1,18 +1,18 @@
 import type { Diagnostic } from './output'
 
+export interface ChangedFile {
+  filename: string
+  /** GitHub omits the patch of a binary file and of a very large diff. */
+  patch?: string
+  status: string
+}
+
 /** Changed lines of each file. `all` means that GitHub did not send a patch, so each line counts. */
 export type ChangedLines = ReadonlyMap<string, 'all' | readonly LineRange[]>
 
 export interface LineRange {
   endLine: number
   startLine: number
-}
-
-export interface PullRequestFile {
-  filename: string
-  /** GitHub omits the patch of a binary file and of a very large diff. */
-  patch?: string
-  status: string
 }
 
 const hunkHeader = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/u
@@ -64,7 +64,7 @@ export function parsePatch(patch: string): LineRange[] {
   return ranges
 }
 
-export function toChangedLines(files: readonly PullRequestFile[]): ChangedLines {
+export function toChangedLines(files: readonly ChangedFile[]): ChangedLines {
   return new Map(
     files
       .filter(file => file.status !== 'removed')
